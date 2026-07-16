@@ -4,64 +4,113 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Self-Hosted GCS</title>
+  <link
+    rel="stylesheet"
+    href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+    integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+    crossorigin=""
+  />
   <link rel="stylesheet" href="/static/styles.css" />
 </head>
 <body>
   <main class="container">
     <h1>Self-Hosted Ground Control</h1>
+    <div class="tabs">
+      <button id="showControlBtn" class="active">Control</button>
+      <button id="showPlanBtn">Plan</button>
+    </div>
 
-    <section class="card">
-      <h2>Connection</h2>
-      <div class="row">
-        <label>Connection</label>
-        <input id="connection" type="text" value="udp:127.0.0.1:14551" />
-      </div>
-      <div class="row">
-        <label>Baud</label>
-        <input id="baud" type="number" value="115200" />
-      </div>
-      <button id="connectBtn">Connect</button>
-    </section>
+    <div id="screenControl" class="screen active">
+      <section class="card">
+        <h2>Connection</h2>
+        <div class="row">
+          <label>Connection</label>
+          <input id="connection" type="text" value="udp:127.0.0.1:14551" />
+        </div>
+        <div class="row">
+          <label>Baud</label>
+          <input id="baud" type="number" value="115200" />
+        </div>
+        <button id="connectBtn">Connect</button>
+      </section>
 
-    <section class="card grid">
-      <h2>Flight Commands</h2>
-      <div class="actions">
-        <button id="armBtn">Arm</button>
-        <button id="disarmBtn">Disarm</button>
-        <button id="guidedBtn">GUIDED</button>
-        <button id="rtlBtn">RTL</button>
-      </div>
-      <div class="row">
-        <label>Takeoff Alt (m)</label>
-        <input id="takeoffAlt" type="number" value="20" />
-        <button id="takeoffBtn">Takeoff</button>
-      </div>
-      <div class="row">
-        <label>Goto Lat</label>
-        <input id="gotoLat" type="number" step="any" />
-      </div>
-      <div class="row">
-        <label>Goto Lon</label>
-        <input id="gotoLon" type="number" step="any" />
-      </div>
-      <div class="row">
-        <label>Goto Alt (m)</label>
-        <input id="gotoAlt" type="number" value="20" />
-        <button id="gotoBtn">Goto</button>
-      </div>
-    </section>
+      <section class="card grid">
+        <h2>Flight Commands</h2>
+        <div class="actions">
+          <button id="armBtn">Arm</button>
+          <button id="disarmBtn">Disarm</button>
+          <button id="guidedBtn">GUIDED</button>
+          <button id="rtlBtn">RTL</button>
+        </div>
+        <div class="row">
+          <label>Takeoff Alt (m)</label>
+          <input id="takeoffAlt" type="number" value="20" />
+          <button id="takeoffBtn">Takeoff</button>
+        </div>
+        <div class="row">
+          <label>Goto Lat</label>
+          <input id="gotoLat" type="number" step="any" />
+        </div>
+        <div class="row">
+          <label>Goto Lon</label>
+          <input id="gotoLon" type="number" step="any" />
+        </div>
+        <div class="row">
+          <label>Goto Alt (m)</label>
+          <input id="gotoAlt" type="number" value="20" />
+          <button id="gotoBtn">Goto</button>
+        </div>
+      </section>
 
-    <section class="card">
-      <h2>Live Status</h2>
-      <pre id="status">Loading...</pre>
-    </section>
+      <section class="card">
+        <h2>Live Status</h2>
+        <pre id="status">Loading...</pre>
+      </section>
 
-    <section class="card">
-      <h2>Activity</h2>
-      <pre id="log"></pre>
-    </section>
+      <section class="card">
+        <h2>Activity</h2>
+        <pre id="log"></pre>
+      </section>
+    </div>
+
+    <div id="screenPlan" class="screen">
+      <section class="card">
+        <h2>Plan</h2>
+        <div class="actions">
+          <button id="addPointModeBtn" class="active">Add Point Mode: ON</button>
+          <button id="removeSelectedBtn">Remove Selected</button>
+          <button id="clearLocalPlanBtn">Clear Local</button>
+          <button id="loadMissionBtn">Load Mission</button>
+          <button id="uploadMissionBtn">Upload Mission</button>
+          <button id="clearMissionBtn">Clear Mission</button>
+        </div>
+        <div id="planMap"></div>
+      </section>
+      <section class="card">
+        <h2>Waypoints</h2>
+        <div class="tableWrap">
+          <table id="waypointTable">
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>Latitude</th>
+                <th>Longitude</th>
+                <th>Altitude (m)</th>
+                <th>Action</th>
+              </tr>
+            </thead>
+            <tbody id="waypointTableBody"></tbody>
+          </table>
+        </div>
+      </section>
+    </div>
   </main>
 
+  <script
+    src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+    integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+    crossorigin=""
+  ></script>
   <script src="/static/app.js"></script>
 </body>
 </html>

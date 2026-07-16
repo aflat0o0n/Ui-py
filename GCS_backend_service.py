@@ -48,9 +48,12 @@ import queue as queue_mod
 import time
 import threading
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from pymavlink import mavutil
 
@@ -523,6 +526,7 @@ class Bridge:
 
 
 bridge = Bridge()
+FRONTEND_DIR = Path(__file__).resolve().parent / "frontend"
 
 
 # ---------------------------------------------------------------------------
@@ -539,6 +543,9 @@ async def lifespan(app: FastAPI):
     yield
 
 app = FastAPI(title="MP Precision Bridge", lifespan=lifespan)
+
+if FRONTEND_DIR.exists():
+    app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="static")
 
 
 class ArmBody(BaseModel):
@@ -584,6 +591,14 @@ async def connect(body: ConnectBody = ConnectBody()):
 @app.get("/status")
 async def status():
     return bridge.snapshot()
+
+
+@app.get("/", include_in_schema=False)
+async def frontend_home():
+    index_path = FRONTEND_DIR / "index.html"
+    if not index_path.exists():
+        raise HTTPException(status_code=404, detail="Frontend not found")
+    return FileResponse(index_path)
 
 
 def _guard(exc: Exception) -> HTTPException:

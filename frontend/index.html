@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Self-Hosted GCS</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <main class="container">
+    <h1>Self-Hosted Ground Control</h1>
+
+    <section class="card">
+      <h2>Connection</h2>
+      <div class="row">
+        <label>Connection</label>
+        <input id="connection" type="text" value="udp:127.0.0.1:14551" />
+      </div>
+      <div class="row">
+        <label>Baud</label>
+        <input id="baud" type="number" value="115200" />
+      </div>
+      <button id="connectBtn">Connect</button>
+    </section>
+
+    <section class="card grid">
+      <h2>Flight Commands</h2>
+      <div class="actions">
+        <button id="armBtn">Arm</button>
+        <button id="disarmBtn">Disarm</button>
+        <button id="guidedBtn">GUIDED</button>
+        <button id="rtlBtn">RTL</button>
+      </div>
+      <div class="row">
+        <label>Takeoff Alt (m)</label>
+        <input id="takeoffAlt" type="number" value="20" />
+        <button id="takeoffBtn">Takeoff</button>
+      </div>
+      <div class="row">
+        <label>Goto Lat</label>
+        <input id="gotoLat" type="number" step="any" />
+      </div>
+      <div class="row">
+        <label>Goto Lon</label>
+        <input id="gotoLon" type="number" step="any" />
+      </div>
+      <div class="row">
+        <label>Goto Alt (m)</label>
+        <input id="gotoAlt" type="number" value="20" />
+        <button id="gotoBtn">Goto</button>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Live Status</h2>
+      <pre id="status">Loading...</pre>
+    </section>
+
+    <section class="card">
+      <h2>Activity</h2>
+      <pre id="log"></pre>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

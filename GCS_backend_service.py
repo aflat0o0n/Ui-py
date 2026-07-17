@@ -101,6 +101,7 @@ class Bridge:
             raise ConnectionError(
                 f"No heartbeat on '{connection}'. Check the port/address, "
                 "baud rate, and that the FC is powered.")
+        self.state["last_heartbeat"] = time.time()   # wait_heartbeat saw one
         self.connected = True
         self._request_streams()
         threading.Thread(target=self._rx_loop, daemon=True).start()
@@ -120,7 +121,12 @@ class Bridge:
     # ------------- receive loop -------------
     def _rx_loop(self):
         while self.connected:
-            msg = self.master.recv_match(blocking=True, timeout=1)
+            try:
+                msg = self.master.recv_match(blocking=True, timeout=1)
+            except (OSError, AttributeError):
+                # socket closed by teardown() while we were blocked in recv;
+                # exit quietly — the supervisor owns reconnection
+                break
             if msg is None:
                 continue
             t = msg.get_type()

@@ -86,10 +86,12 @@ def start_all(timeout_s: float = 30) -> dict:
                    f"--out=udp:127.0.0.1:{cfg['mp_port']}",
                    "--daemon"])
 
-    # 2. Backend: attaches to the router's GCS port by default.
+    # 2. Backend: attaches to the router's GCS port by default. Bind to
+    #    0.0.0.0 so the self-hosted UI is reachable from other machines on
+    #    the LAN; the health check below still probes it over loopback.
     _popen_hidden(
         [sys.executable, "-m", "uvicorn", "GCS_backend_service:app",
-         "--host", "127.0.0.1", "--port", str(cfg["backend_port"])],
+         "--host", "0.0.0.0", "--port", str(cfg["backend_port"])],
         env={"GCS_CONNECTION": f"udp:127.0.0.1:{cfg['gcs_port']}"})
 
     # 3. Wait until the backend is answering.

@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GCS Bench Panel</title>
+<style>
+  :root {
+    --bg: #12161c; --panel: #1a2028; --panel2: #212936;
+    --line: #2c3644; --text: #d8dee6; --dim: #8b96a5;
+    --ok: #37c871; --warn: #f5a623; --bad: #e5484d; --acc: #4d9fdc;
+    --mono: ui-monospace, "Cascadia Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  body { background: var(--bg); color: var(--text);
+         font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+         padding: 18px; }
+  h1 { font-size: 15px; font-weight: 600; letter-spacing: .12em;
+       text-transform: uppercase; color: var(--dim); margin-bottom: 14px; }
+  h1 b { color: var(--text); }
+
+  /* annunciator strip — the one thing you must never miss */
+  .annunciator { display: grid; grid-template-columns: 2fr 1fr 1fr 1fr;
+                 gap: 8px; margin-bottom: 16px; }
+  .ann { padding: 14px 16px; border-radius: 6px; border: 1px solid var(--line);
+         background: var(--panel); font-family: var(--mono); }
+  .ann .lbl { font-size: 10px; letter-spacing: .18em; color: var(--dim); }
+  .ann .val { font-size: 22px; font-weight: 700; margin-top: 2px; }
+  .ann.link-dead { background: #3a1418; border-color: var(--bad); }
+  .ann.link-dead .val { color: var(--bad); }
+  .ann.link-live { background: #12301f; border-color: var(--ok); }
+  .ann.link-live .val { color: var(--ok); }
+  .ann.armed .val { color: var(--warn); }
+
+  .grid { display: grid; grid-template-columns: 340px 1fr; gap: 16px; }
+  @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+  section { background: var(--panel); border: 1px solid var(--line);
+            border-radius: 8px; padding: 14px 16px; margin-bottom: 16px; }
+  section h2 { font-size: 11px; letter-spacing: .15em; text-transform: uppercase;
+               color: var(--dim); margin-bottom: 10px; }
+
+  table.tele { width: 100%; border-collapse: collapse; font-family: var(--mono); }
+  table.tele td { padding: 4px 0; border-bottom: 1px solid var(--line); }
+  table.tele td:first-child { color: var(--dim); font-size: 12px; }
+  table.tele td:last-child { text-align: right; font-size: 15px; }
+
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+         margin-bottom: 8px; }
+  button { background: var(--panel2); color: var(--text); border: 1px solid var(--line);
+           border-radius: 6px; padding: 8px 14px; font: inherit; cursor: pointer; }
+  button:hover { border-color: var(--acc); }
+  button:focus-visible { outline: 2px solid var(--acc); outline-offset: 1px; }
+  button.arm { border-color: var(--warn); color: var(--warn); }
+  button.danger { border-color: var(--bad); color: var(--bad); }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  input { background: var(--bg); border: 1px solid var(--line); color: var(--text);
+          border-radius: 6px; padding: 8px 10px; font-family: var(--mono);
+          width: 130px; }
+  input:focus-visible { outline: 2px solid var(--acc); outline-offset: 1px; }
+
+  #wptable { width: 100%; border-collapse: collapse; font-family: var(--mono);
+             font-size: 13px; margin-bottom: 8px; }
+  #wptable th { color: var(--dim); font-weight: 400; text-align: left;
+                font-size: 11px; padding-bottom: 4px; }
+  #wptable td { padding: 2px 6px 2px 0; }
+  #wptable input { width: 100%; padding: 5px 8px; }
+
+  #log { font-family: var(--mono); font-size: 12px; max-height: 260px;
+         overflow-y: auto; }
+  #log div { padding: 3px 0; border-bottom: 1px solid var(--line); }
+  #log .t { color: var(--dim); margin-right: 8px; }
+  #log .ok { color: var(--ok); }
+  #log .bad { color: var(--bad); }
+  .sync { font-family: var(--mono); font-size: 12px; padding: 3px 8px;
+          border-radius: 4px; border: 1px solid var(--warn); color: var(--warn); }
+  .sync.yes { border-color: var(--ok); color: var(--ok); }
+</style>
+</head>
+<body>
+<h1><b>GCS bench panel</b> — backend test console</h1>
+
+<div class="annunciator">
+  <div class="ann link-dead" id="annLink">
+    <div class="lbl">LINK</div><div class="val" id="linkVal">NO LINK</div>
+  </div>
+  <div class="ann" id="annMode">
+    <div class="lbl">MODE</div><div class="val" id="modeVal">—</div>
+  </div>
+  <div class="ann" id="annArm">
+    <div class="lbl">ARM STATE</div><div class="val" id="armVal">—</div>
+  </div>
+  <div class="ann">
+    <div class="lbl">BATTERY</div><div class="val" id="battVal">—</div>
+  </div>
+</div>
+
+<div class="grid">
+<div>
+  <section>
+    <h2>Link</h2>
+    <div class="row">
+      <select id="portSel" style="flex:1;background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:6px;padding:8px"></select>
+      <button onclick="loadPorts()">Rescan</button>
+    </div>
+    <div class="row">
+      <select id="baudSel" style="background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:6px;padding:8px"></select>
+      <button id="btnConnect" onclick="doConnect()">Connect</button>
+    </div>
+    <div class="row" style="margin-top:6px">
+      <select id="protoSel" style="background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:6px;padding:8px">
+        <option value="udp">udp</option><option value="tcp">tcp</option>
+      </select>
+      <input id="ipInput" placeholder="IP address" style="flex:1">
+      <input id="netPort" value="14550" style="width:80px" aria-label="network port">
+      <button onclick="doConnectNet()">Connect IP</button>
+    </div>
+    <div class="row" style="color:var(--dim);font-size:12px" id="connHint">
+      Serial: pick a port + baud. Network: type an IP + port.
+    </div>
+  </section>
+
+  <section>
+    <h2>Telemetry</h2>
+    <table class="tele">
+      <tr><td>latitude</td><td id="tLat">—</td></tr>
+      <tr><td>longitude</td><td id="tLon">—</td></tr>
+      <tr><td>altitude (rel)</td><td id="tAlt">—</td></tr>
+      <tr><td>groundspeed</td><td id="tSpd">—</td></tr>
+      <tr><td>heading</td><td id="tHdg">—</td></tr>
+      <tr><td>heartbeat age</td><td id="tHb">—</td></tr>
+    </table>
+  </section>
+
+  <section>
+    <h2>Parameter</h2>
+    <div class="row">
+      <input id="pName" placeholder="WP_SPD" style="width:150px">
+      <button onclick="paramGet()">Read</button>
+    </div>
+    <div class="row">
+      <input id="pVal" placeholder="value" style="width:150px">
+      <button onclick="paramSet()">Write (verified)</button>
+    </div>
+  </section>
+</div>
+
+<div>
+  <section>
+    <h2>Flight commands — every result is the drone's real answer</h2>
+    <div class="row">
+      <button onclick="cmd('MODE GUIDED','/command/mode',{mode:'GUIDED'})">Mode GUIDED</button>
+      <button class="arm" onclick="cmd('ARM','/command/arm',{arm:true})">Arm</button>
+      <button onclick="cmd('DISARM','/command/arm',{arm:false})">Disarm</button>
+      <button class="danger" onclick="cmd('RTL','/command/rtl')">RTL</button>
+    </div>
+    <div class="row">
+      <input id="toAlt" value="20" aria-label="takeoff altitude">
+      <button onclick="cmd('TAKEOFF','/command/takeoff',{altitude:+el('toAlt').value})">Takeoff (m)</button>
+    </div>
+    <div class="row">
+      <input id="gLat" placeholder="lat"><input id="gLon" placeholder="lon">
+      <input id="gAlt" value="20" style="width:70px" aria-label="goto altitude">
+      <button onclick="cmd('GOTO','/command/goto',{lat:+el('gLat').value,lon:+el('gLon').value,altitude:+el('gAlt').value})">Goto</button>
+      <button onclick="fillHere()">Use current pos</button>
+    </div>
+  </section>
+
+  <section>
+    <h2>Mission <span class="sync" id="syncBadge">unsynced draft</span></h2>
+    <table id="wptable">
+      <thead><tr><th>#</th><th>latitude</th><th>longitude</th><th>alt m</th><th></th></tr></thead>
+      <tbody id="wpbody"></tbody>
+    </table>
+    <div class="row">
+      <button onclick="addWp()">Add waypoint</button>
+      <button onclick="uploadMission()">Upload → verify</button>
+      <button onclick="downloadMission()">Download from drone</button>
+      <button onclick="clearMission()">Clear on drone</button>
+      <button id="btnStart" disabled
+        onclick="cmd('MODE AUTO','/command/mode',{mode:'AUTO'}).then(()=>cmd('MISSION START','/command/mission_start'))">
+        Start mission</button>
+    </div>
+  </section>
+
+  <section>
+    <h2>Event log</h2>
+    <div id="log" aria-live="polite"></div>
+  </section>
+</div>
+</div>
+
+<script>
+const el = id => document.getElementById(id);
+let lastState = null, synced = false;
+
+function log(name, ok, detail) {
+  const d = document.createElement('div');
+  d.innerHTML = `<span class="t">${new Date().toLocaleTimeString()}</span>` +
+    `<span class="${ok ? 'ok' : 'bad'}">${ok ? 'OK ' : 'REJ'}</span> ` +
+    `${name} — ${detail}`;
+  el('log').prepend(d);
+}
+
+async function api(method, path, body) {
+  const r = await fetch(path, {
+    method, headers: {'Content-Type': 'application/json'},
+    body: body === undefined ? undefined : JSON.stringify(body)
+  });
+  let data = {};
+  try { data = await r.json(); } catch (e) {}
+  return {status: r.status, data};
+}
+
+async function cmd(name, path, body = {}) {
+  try {
+    const {status, data} = await api('POST', path, body);
+    const ok = status === 200 && data.accepted !== false;
+    log(name, ok, data.result || data.detail || JSON.stringify(data));
+    return ok;
+  } catch (e) { log(name, false, 'backend unreachable'); return false; }
+}
+
+async function loadPorts() {
+  try {
+    const {data} = await api('GET', '/ports');
+    const ps = el('portSel'); ps.innerHTML = '';
+    (data.ports || []).forEach(p => {
+      const o = document.createElement('option');
+      o.value = p.device; o.textContent = p.description; ps.appendChild(o);
+    });
+    const bs = el('baudSel'); bs.innerHTML = '';
+    (data.bauds || [57600,115200]).forEach(b => {
+      const o = document.createElement('option');
+      o.value = b; o.textContent = b; bs.appendChild(o);
+    });
+  } catch (e) { log('PORTS', false, 'scan failed'); }
+}
+
+async function doConnectNet() {
+  const ip = el('ipInput').value.trim();
+  if (!ip) { el('connHint').textContent = 'Enter an IP address.'; return; }
+  const connection = `${el('protoSel').value}:${ip}:${+el('netPort').value}`;
+  el('btnConnect').disabled = true;
+  el('connHint').textContent = 'Waiting for heartbeat…';
+  const {status, data} = await api('POST', '/connect', {connection});
+  if (status === 200) { log('CONNECT', true, data.connection);
+    el('connHint').textContent = 'Connected via ' + data.connection; startTelemetry(); }
+  else { log('CONNECT', false, data.detail || status);
+    el('connHint').textContent = data.detail || 'Connect failed'; el('btnConnect').disabled = false; }
+}
+
+async function doConnect() {
+  const connection = el('portSel').value;
+  const baud = +el('baudSel').value;
+  if (!connection) { el('connHint').textContent = 'Pick a port first.'; return; }
+  el('btnConnect').disabled = true;
+  el('connHint').textContent = 'Waiting for heartbeat…';
+  const {status, data} = await api('POST', '/connect', {connection, baud});
+  if (status === 200) {
+    log('CONNECT', true, data.connection);
+    el('connHint').textContent = 'Connected via ' + data.connection;
+    startTelemetry();
+  } else {
+    log('CONNECT', false, data.detail || status);
+    el('connHint').textContent = data.detail || 'Connect failed';
+    el('btnConnect').disabled = false;
+  }
+}
+
+function startTelemetry() {
+  const ws = new WebSocket(`ws://${location.host}/ws/telemetry`);
+  ws.onmessage = ev => render(JSON.parse(ev.data));
+  ws.onclose = () => {
+    setAnn(false); el('btnConnect').disabled = false;
+    log('TELEMETRY', false, 'stream closed');
+  };
+}
+
+function setAnn(alive) {
+  el('annLink').className = 'ann ' + (alive ? 'link-live' : 'link-dead');
+  el('linkVal').textContent = alive ? 'LINK OK' : 'LINK LOST';
+}
+
+function render(s) {
+  lastState = s;
+  setAnn(s.link_alive);
+  el('modeVal').textContent = s.mode || '—';
+  el('armVal').textContent = s.armed ? 'ARMED' : 'DISARMED';
+  el('annArm').className = 'ann' + (s.armed ? ' armed' : '');
+  el('battVal').textContent = s.battery_v.toFixed(1) + ' V';
+  el('tLat').textContent = s.lat.toFixed(7);
+  el('tLon').textContent = s.lon.toFixed(7);
+  el('tAlt').textContent = s.alt_rel.toFixed(1) + ' m';
+  el('tSpd').textContent = s.groundspeed.toFixed(1) + ' m/s';
+  el('tHdg').textContent = s.heading.toFixed(0) + '°';
+  el('tHb').textContent =
+    Math.max(0, (Date.now()/1000 - s.last_heartbeat)).toFixed(1) + ' s';
+}
+
+function fillHere() {
+  if (!lastState) return;
+  el('gLat').value = lastState.lat.toFixed(7);
+  el('gLon').value = lastState.lon.toFixed(7);
+}
+
+/* ---------- mission table with verified round-trip ---------- */
+function setSync(yes, text) {
+  synced = yes;
+  const b = el('syncBadge');
+  b.className = 'sync' + (yes ? ' yes' : '');
+  b.textContent = text;
+  el('btnStart').disabled = !yes;
+}
+
+function addWp(lat = '', lon = '', alt = 25) {
+  const tb = el('wpbody');
+  const tr = document.createElement('tr');
+  tr.innerHTML = `<td>${tb.children.length + 1}</td>
+    <td><input value="${lat}" oninput="setSync(false,'unsynced draft')"></td>
+    <td><input value="${lon}" oninput="setSync(false,'unsynced draft')"></td>
+    <td><input value="${alt}" oninput="setSync(false,'unsynced draft')"></td>
+    <td><button onclick="this.closest('tr').remove();setSync(false,'unsynced draft')">×</button></td>`;
+  tb.appendChild(tr);
+  setSync(false, 'unsynced draft');
+}
+
+function draftWps() {
+  return [...el('wpbody').children].map(tr => {
+    const [lat, lon, alt] = [...tr.querySelectorAll('input')].map(i => +i.value);
+    return {lat, lon, alt};
+  });
+}
+
+async function uploadMission() {
+  const wps = draftWps();
+  if (!wps.length) { log('MISSION UPLOAD', false, 'no waypoints'); return; }
+  const {status, data} = await api('POST', '/mission', {waypoints: wps});
+  const ok = status === 200 && data.accepted;
+  log('MISSION UPLOAD', ok, data.result || data.detail);
+  if (ok) downloadMission();          // the honest step: verify what landed
+  else setSync(false, 'upload rejected — draft kept');
+}
+
+async function downloadMission() {
+  const {status, data} = await api('GET', '/mission');
+  if (status !== 200) { log('MISSION DOWNLOAD', false, data.detail); return; }
+  const items = (data.items || []).filter(i => i.seq > 0);
+  el('wpbody').innerHTML = '';
+  items.forEach(i => addWp(i.lat.toFixed(7), i.lon.toFixed(7), i.alt));
+  setSync(true, items.length + ' waypoints confirmed on drone');
+  log('MISSION DOWNLOAD', true, items.length + ' items');
+}
+
+async function clearMission() {
+  const {status, data} = await api('DELETE', '/mission');
+  const ok = status === 200 && data.accepted;
+  log('MISSION CLEAR', ok, data.result || data.detail);
+  if (ok) { el('wpbody').innerHTML = ''; setSync(true, 'drone mission empty'); }
+}
+
+/* ---------- parameters ---------- */
+async function paramGet() {
+  const n = el('pName').value.trim().toUpperCase();
+  const {status, data} = await api('GET', '/parameters/' + n);
+  if (status === 200) { el('pVal').value = data.value; log('PARAM ' + n, true, 'value ' + data.value); }
+  else log('PARAM ' + n, false, data.detail);
+}
+
+async function paramSet() {
+  const n = el('pName').value.trim().toUpperCase();
+  const {status, data} = await api('PUT', '/parameters/' + n,
+                                   {value: +el('pVal').value});
+  if (status === 200)
+    log('PARAM SET ' + n, data.accepted,
+        `requested ${data.requested} confirmed ${data.confirmed}`);
+  else log('PARAM SET ' + n, false, data.detail);
+}
+
+addWp(); addWp();   // start with two empty rows
+loadPorts();        // populate the port dropdown
+</script>
+</body>
+</html>

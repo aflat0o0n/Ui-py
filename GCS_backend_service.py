@@ -601,6 +601,31 @@ async def frontend_home():
     return FileResponse(index_path)
 
 
+@app.get("/ports")
+async def list_ports():
+    """List serial ports plus a SITL preset."""
+    ports = []
+    try:
+        from serial.tools import list_ports as _lp
+        for p in _lp.comports():
+            ports.append({"device": p.device,
+                          "description": p.description or p.device})
+    except Exception as e:
+        ports.append({"device": "", "description": f"(port scan failed: {e})"})
+    ports.append({"device": "tcp:127.0.0.1:5760",
+                  "description": "SITL simulator (local)"})
+    return {"ports": ports, "bauds": [57600, 115200, 921600, 38400, 9600]}
+
+
+@app.get("/panel", include_in_schema=False)
+async def panel():
+    panel_path = Path(__file__).resolve().parent / "gcs_panel.html"
+    if not panel_path.exists():
+        raise HTTPException(status_code=404,
+                            detail="gcs_panel.html not found")
+    return FileResponse(panel_path)
+
+
 def _guard(exc: Exception) -> HTTPException:
     if isinstance(exc, ConnectionError):
         return HTTPException(status_code=503, detail=str(exc))

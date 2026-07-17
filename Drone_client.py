@@ -77,6 +77,12 @@ class DroneClient(QObject):
         self._pool = QThreadPool.globalInstance()
         self._tele: _TelemetryThread | None = None
 
+    @staticmethod
+    def set_backend_url(url: str):
+        """Point the client at a specific backend URL."""
+        global BACKEND
+        BACKEND = url
+
     # -------- internal request helpers --------
     def _post(self, name: str, path: str, body: dict | None = None,
               timeout: float = 60):
@@ -102,13 +108,23 @@ class DroneClient(QObject):
         self._pool.start(_Job(work))
 
     # -------- connection --------
-    def connect_drone(self, connection: str, baud: int = 115200):
-        """connection: 'tcp:127.0.0.1:5760' (SITL) or '/dev/ttyUSB0' etc."""
+    def list_ports(self):
+        """Fetch selectable ports for connection dialog use."""
+        self._get("PORTS", "/ports", timeout=10)
+
+    def connect_drone(self, connection: str | None = None,
+                      baud: int | None = None):
+        """No args uses backend defaults; args override connection settings."""
+        body = {}
+        if connection:
+            body["connection"] = connection
+        if baud:
+            body["baud"] = baud
+
         def work():
             try:
                 r = requests.post(BACKEND + "/connect",
-                                  json={"connection": connection,
-                                        "baud": baud}, timeout=25)
+                                  json=body or None, timeout=25)
                 ok = r.status_code == 200
                 if ok:
                     self._start_telemetry()

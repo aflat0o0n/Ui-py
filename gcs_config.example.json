@@ -1,0 +1,16 @@
+{
+    "_comment": "Copy to gcs_config.json and edit for your machine.",
+    "_drone_connection_examples": {
+        "serial_linux": "/dev/ttyUSB0",
+        "serial_windows": "COM7",
+        "sitl_local": "tcp:127.0.0.1:5760",
+        "mp_forward_same_pc": "udp:127.0.0.1:14550",
+        "mp_forward_from_other_pc": "udp:0.0.0.0:14550"
+    },
+    "drone_connection": "tcp:127.0.0.1:5760",
+    "drone_baud": 57600,
+
+    "_backend_host": "0.0.0.0 = reachable from phone/other PC/Mission Planner; 127.0.0.1 = local only",
+    "backend_host": "0.0.0.0",
+    "backend_port": 8000
+}

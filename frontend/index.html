@@ -67,10 +67,6 @@
         <pre id="status">Loading...</pre>
       </section>
 
-      <section class="card">
-        <h2>Activity</h2>
-        <pre id="log"></pre>
-      </section>
     </div>
 
     <div id="screenPlan" class="screen">
@@ -83,6 +79,9 @@
           <button id="loadMissionBtn">Load Mission</button>
           <button id="uploadMissionBtn">Upload Mission</button>
           <button id="clearMissionBtn">Clear Mission</button>
+          <button id="readFileBtn">Read File</button>
+          <button id="writeFileBtn">Write File</button>
+          <input id="missionFileInput" type="file" accept=".waypoints,.txt,text/plain" hidden />
         </div>
         <div id="planMap"></div>
       </section>
@@ -104,6 +103,19 @@
         </div>
       </section>
     </div>
+
+    <section class="card" id="logSection">
+      <h2>Logs</h2>
+      <div class="actions logControls">
+        <label class="inline"><input id="logAutoscroll" type="checkbox" checked /> Follow</label>
+        <input id="logFilter" type="text" placeholder="Filter logs..." />
+        <button id="copyLogBtn">Copy</button>
+        <button id="downloadLogBtn">Download</button>
+        <button id="clearLogBtn">Clear</button>
+      </div>
+      <pre id="log"></pre>
+      <div class="logMeta"><span id="logCount">0 entries</span></div>
+    </section>
   </main>
 
   <script

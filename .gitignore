@@ -1,0 +1,10 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# PyInstaller build outputs
+/build/
+/dist/
+
+# Local runtime config (operators create their own from the example)
+gcs_config.json

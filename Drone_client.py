@@ -79,7 +79,8 @@ class DroneClient(QObject):
 
     @staticmethod
     def set_backend_url(url: str):
-        """Point the client at a specific backend URL."""
+        """Point the client at the backend's actual URL (e.g. when the
+        backend picked a fallback port). Call before creating DroneClient."""
         global BACKEND
         BACKEND = url
 
@@ -109,12 +110,15 @@ class DroneClient(QObject):
 
     # -------- connection --------
     def list_ports(self):
-        """Fetch selectable ports for connection dialog use."""
+        """Fetch selectable ports for the connect dialog. Result arrives on
+        command_result as ("PORTS", {"ports":[...], "bauds":[...]})."""
         self._get("PORTS", "/ports", timeout=10)
 
     def connect_drone(self, connection: str | None = None,
                       baud: int | None = None):
-        """No args uses backend defaults; args override connection settings."""
+        """No args = use the backend's configured default target.
+        connection: 'tcp:127.0.0.1:5760' (SITL), '/dev/ttyUSB0',
+        'udp:0.0.0.0:14550' (listen for MP forward), etc."""
         body = {}
         if connection:
             body["connection"] = connection

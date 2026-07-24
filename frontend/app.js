@@ -148,6 +148,24 @@ bind('gotoBtn', () => command('/command/goto', {
   altitude: Number(gotoAltEl.value || 20),
 }, 'Goto'));
 
+// VTOL / QuadPlane flight modes. Each button carries its ArduPilot mode name
+// in data-mode; the backend resolves it via the FC's mode_mapping().
+const modeButtons = Array.from(document.querySelectorAll('button[data-mode]'));
+modeButtons.forEach((btn) => {
+  const mode = btn.dataset.mode;
+  btn.addEventListener('click', () => command('/command/mode', { mode }, `Mode ${mode}`));
+});
+
+function highlightActiveMode(mode) {
+  modeButtons.forEach((btn) => {
+    btn.classList.toggle('active', btn.dataset.mode === mode);
+  });
+}
+
+// QuadPlane VTOL transitions (MAV_CMD_DO_VTOL_TRANSITION on the backend).
+bind('toFixedWingBtn', () => command('/command/transition', { fixed_wing: true }, 'Transition to Fixed-wing'));
+bind('toMulticopterBtn', () => command('/command/transition', { fixed_wing: false }, 'Transition to Multicopter'));
+
 async function command(path, body, label) {
   try {
     const r = await api(path, 'POST', body || undefined);
@@ -263,6 +281,7 @@ function applyState(state) {
   statusEl.textContent = JSON.stringify(state, null, 2);
   if (state && typeof state === 'object') {
     setHomePosition(Number(state.lat), Number(state.lon));
+    highlightActiveMode(state.mode);
   }
 }
 

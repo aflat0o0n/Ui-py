@@ -63,6 +63,34 @@
       </section>
 
       <section class="card">
+        <h2>VTOL Modes</h2>
+        <div class="modeRow">
+          <span class="modeLabel">Fixed-wing</span>
+          <div class="actions modeGroup">
+            <button data-mode="MANUAL">Manual</button>
+            <button data-mode="STABILIZE">Stabilize</button>
+            <button data-mode="CRUISE">Cruise</button>
+          </div>
+        </div>
+        <div class="modeRow">
+          <span class="modeLabel">QuadPlane</span>
+          <div class="actions modeGroup">
+            <button data-mode="QHOVER">QHover</button>
+            <button data-mode="QLOITER">QLoiter</button>
+            <button data-mode="QLAND">QLand</button>
+            <button data-mode="QRTL">QRTL</button>
+          </div>
+        </div>
+        <div class="modeRow">
+          <span class="modeLabel">Transition</span>
+          <div class="actions modeGroup">
+            <button id="toFixedWingBtn">To Fixed-wing</button>
+            <button id="toMulticopterBtn">To Multicopter</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="card">
         <h2>Live Status</h2>
         <pre id="status">Loading...</pre>
       </section>

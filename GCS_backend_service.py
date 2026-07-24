@@ -29,6 +29,7 @@ Endpoints:
   POST /command/takeoff        -> {"altitude": 10}
   POST /command/goto           -> {"lat": .., "lon": .., "altitude": ..}
   POST /command/rtl
+  POST /command/transition     -> {"fixed_wing": true|false} VTOL transition
   POST /command/mission_start  -> begin AUTO mission
   GET  /mission                -> download current mission from FC
   POST /mission                -> upload mission (list of waypoints)
@@ -227,6 +228,18 @@ class Bridge:
             self.master.mav.command_long_send(
                 self.master.target_system, self.master.target_component,
                 cmd, 0, 0, 0, 0, 0, 0, 0, 0))
+
+    def vtol_transition(self, to_fixed_wing: bool) -> dict:
+        """Command a QuadPlane VTOL transition (MAV_CMD_DO_VTOL_TRANSITION).
+        to_fixed_wing=True -> fixed-wing (forward flight);
+        to_fixed_wing=False -> multicopter (hover)."""
+        state = (mavutil.mavlink.MAV_VTOL_STATE_FW if to_fixed_wing
+                 else mavutil.mavlink.MAV_VTOL_STATE_MC)
+        cmd = mavutil.mavlink.MAV_CMD_DO_VTOL_TRANSITION
+        return self._send_verified(cmd, lambda:
+            self.master.mav.command_long_send(
+                self.master.target_system, self.master.target_component,
+                cmd, 0, state, 0, 0, 0, 0, 0, 0))
 
     def goto(self, lat: float, lon: float, alt_m: float) -> dict:
         """Position target in 1e7 int format (~1 cm resolution).
@@ -678,6 +691,20 @@ async def cmd_goto(body: GotoBody):
 async def cmd_rtl():
     try:
         return await _run(bridge.rtl)
+    except Exception as e:
+        raise _guard(e)
+
+
+class TransitionBody(BaseModel):
+    fixed_wing: bool = Field(
+        description="True -> fixed-wing (forward flight); "
+                    "False -> multicopter (hover)")
+
+
+@app.post("/command/transition")
+async def cmd_transition(body: TransitionBody):
+    try:
+        return await _run(bridge.vtol_transition, body.fixed_wing)
     except Exception as e:
         raise _guard(e)
 

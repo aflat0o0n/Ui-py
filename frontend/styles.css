@@ -38,6 +38,24 @@ h1, h2 { margin-top: 0; }
   flex-wrap: wrap;
   margin-bottom: 10px;
 }
+.modeRow {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+.modeRow:last-child {
+  margin-bottom: 0;
+}
+.modeLabel {
+  width: 90px;
+  flex-shrink: 0;
+  font-size: 13px;
+  color: #8fa3c8;
+}
+.modeGroup {
+  margin-bottom: 0;
+}
 input, button {
   border-radius: 8px;
   border: 1px solid #30446e;

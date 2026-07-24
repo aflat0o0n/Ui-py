@@ -44,11 +44,15 @@ the real result. Nothing is fire-and-forget.
 """
 
 import asyncio
+import collections
+import csv
+import math
 import os
 import queue as queue_mod
 import time
 import threading
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -68,6 +72,36 @@ ACK_TIMEOUT_S = 3.0
 HEARTBEAT_STALE_S = 5.0
 HEARTBEAT_LOST_S = 10.0      # supervisor reconnects after this silence
 
+# Our GCS system ID. Mission Planner uses 255; we MUST differ so the FC,
+# the router, and ACK routing can tell the two ground stations apart.
+GCS_SOURCE_SYSTEM = int(os.environ.get("GCS_SOURCE_SYSTEM", "254"))
+
+# MAV_TYPE -> human vehicle family (a QuadPlane reports FIXED_WING;
+# confirm VTOL capability via the Q_ENABLE parameter after connecting)
+_VEHICLE_FAMILY = {
+    1:  "plane",       # MAV_TYPE_FIXED_WING (incl. QuadPlane)
+    2:  "copter",      # MAV_TYPE_QUADROTOR
+    13: "copter",      # MAV_TYPE_HEXAROTOR
+    14: "copter",      # MAV_TYPE_OCTOROTOR
+    19: "vtol",        # MAV_TYPE_VTOL_TAILSITTER_DUOROTOR
+    20: "vtol",        # MAV_TYPE_VTOL_TAILSITTER_QUADROTOR
+    21: "vtol",        # MAV_TYPE_VTOL_TILTROTOR
+    22: "vtol",        # MAV_TYPE_VTOL_FIXEDROTOR
+}
+_VTOL_STATE_NAMES = {0: "undefined", 1: "transition_to_fw",
+                     2: "transition_to_mc", 3: "mc", 4: "fw"}
+_GPS_FIX_NAMES = {0: "NO_GPS", 1: "NO_FIX", 2: "2D_FIX", 3: "3D_FIX",
+                  4: "DGPS", 5: "RTK_FLOAT", 6: "RTK_FIXED"}
+_SEVERITY_NAMES = {0: "emergency", 1: "alert", 2: "critical", 3: "error",
+                   4: "warning", 5: "notice", 6: "info", 7: "debug"}
+# EKF healthy = attitude + horizontal velocity + absolute horizontal
+# position estimates all valid (EKF_STATUS_REPORT flags bits)
+_EKF_HEALTHY_BITS = (1 | 2 | 16)   # ATTITUDE | VELOCITY_HORIZ | POS_HORIZ_ABS
+
+# Flight logs (CSV per armed flight) land here:
+LOG_DIR = Path(os.environ.get("GCS_LOG_DIR",
+                              str(Path.home() / "gcs_flight_logs")))
+
 
 # ---------------------------------------------------------------------------
 # MAVLink bridge core (thread-based; FastAPI talks to it via asyncio bridges)
@@ -86,16 +120,41 @@ class Bridge:
         self.state = {
             "lat": 0.0, "lon": 0.0, "alt_rel": 0.0,
             "mode": None, "armed": False,
-            "groundspeed": 0.0, "heading": 0.0,
-            "battery_v": 0.0, "last_heartbeat": 0.0,
+            "roll": 0.0, "pitch": 0.0, "yaw": 0.0,
+            "groundspeed": 0.0, "airspeed": 0.0, "climb": 0.0,
+            "throttle": 0, "heading": 0.0,
+            "battery_v": 0.0, "battery_a": 0.0, "battery_pct": -1,
+            "gps_fix": 0, "gps_fix_name": "NO_GPS",
+            "satellites": 0, "hdop": 99.99,
+            "ekf_ok": False, "ekf_flags": 0,
+            "vehicle": None,          # "copter" | "plane" | "vtol"
+            "vtol_state": None,       # "mc" | "fw" | "transition_*"
+            "landed_state": None,     # 1 on ground, 2 in air (EXT_SYS_STATE)
+            "current_wp": 0, "wp_dist": 0.0,
+            "home_lat": None, "home_lon": None, "home_alt": None,
+            "last_heartbeat": 0.0,
         }
+        # STATUSTEXT / event ring buffer: [{"seq","time","severity","text"}]
+        self._events = collections.deque(maxlen=200)
+        self._event_seq = 0
+        self._events_lock = threading.Lock()
+        # link intent: user connected on purpose; cleared by /disconnect so
+        # the supervisor doesn't fight an explicit disconnect
+        self._want_link = False
+        # flight logging (CSV per armed flight)
+        self._log_fh = None
+        self._log_lock = threading.Lock()
+        self._log_last_row = 0.0
 
     # ------------- connection -------------
     def connect(self, connection: str = DEFAULT_CONNECTION,
                 baud: int = 115200) -> None:
         if self.connected:
             return
-        self.master = mavutil.mavlink_connection(connection, baud=baud)
+        # source_system 254: never 255, or the FC/router confuses us with
+        # Mission Planner running alongside on the same link.
+        self.master = mavutil.mavlink_connection(
+            connection, baud=baud, source_system=GCS_SOURCE_SYSTEM)
         hb = self.master.wait_heartbeat(timeout=15)
         if hb is None:
             self.master = None
@@ -104,14 +163,23 @@ class Bridge:
                 "baud rate, and that the FC is powered.")
         self.state["last_heartbeat"] = time.time()   # wait_heartbeat saw one
         self.connected = True
+        self._want_link = True
         self._request_streams()
         threading.Thread(target=self._rx_loop, daemon=True).start()
 
     def _request_streams(self):
         intervals = {
             mavutil.mavlink.MAVLINK_MSG_ID_GLOBAL_POSITION_INT: 100_000,  # 10 Hz
+            mavutil.mavlink.MAVLINK_MSG_ID_ATTITUDE: 100_000,             # 10 Hz
             mavutil.mavlink.MAVLINK_MSG_ID_VFR_HUD: 200_000,              # 5 Hz
             mavutil.mavlink.MAVLINK_MSG_ID_SYS_STATUS: 500_000,           # 2 Hz
+            mavutil.mavlink.MAVLINK_MSG_ID_GPS_RAW_INT: 500_000,          # 2 Hz
+            mavutil.mavlink.MAVLINK_MSG_ID_NAV_CONTROLLER_OUTPUT: 500_000,
+            mavutil.mavlink.MAVLINK_MSG_ID_MISSION_CURRENT: 1_000_000,    # 1 Hz
+            mavutil.mavlink.MAVLINK_MSG_ID_EKF_STATUS_REPORT: 1_000_000,  # 1 Hz
+            mavutil.mavlink.MAVLINK_MSG_ID_HOME_POSITION: 2_000_000,      # 0.5 Hz
+            # VTOL transition + landed state (QuadPlane essential)
+            mavutil.mavlink.MAVLINK_MSG_ID_EXTENDED_SYS_STATE: 500_000,   # 2 Hz
         }
         for msg_id, us in intervals.items():
             self.master.mav.command_long_send(
@@ -131,22 +199,75 @@ class Bridge:
             if msg is None:
                 continue
             t = msg.get_type()
+            # CRITICAL when Mission Planner shares the link: the router
+            # forwards MP's own heartbeats (MAV_TYPE_GCS, sysid 255) to us.
+            # Only messages from the autopilot may drive vehicle state.
+            from_vehicle = (msg.get_srcSystem() == self.master.target_system)
             if t == "HEARTBEAT":
+                if (not from_vehicle or
+                        msg.type == mavutil.mavlink.MAV_TYPE_GCS):
+                    continue   # another ground station's heartbeat — ignore
                 self.state["mode"] = mavutil.mode_string_v10(msg)
-                self.state["armed"] = bool(
-                    msg.base_mode &
-                    mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
+                armed = bool(msg.base_mode &
+                             mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
+                if armed != self.state["armed"]:      # arm/disarm edge
+                    self._log_start() if armed else self._log_stop()
+                self.state["armed"] = armed
+                self.state["vehicle"] = _VEHICLE_FAMILY.get(msg.type,
+                                                            f"type_{msg.type}")
                 self.state["last_heartbeat"] = time.time()
             elif t == "GLOBAL_POSITION_INT":
                 self.state["lat"] = msg.lat / 1e7
                 self.state["lon"] = msg.lon / 1e7
                 self.state["alt_rel"] = msg.relative_alt / 1000.0
                 self.state["heading"] = msg.hdg / 100.0
+                self._log_row()
+            elif t == "ATTITUDE":
+                self.state["roll"] = math.degrees(msg.roll)
+                self.state["pitch"] = math.degrees(msg.pitch)
+                self.state["yaw"] = math.degrees(msg.yaw)
             elif t == "VFR_HUD":
                 self.state["groundspeed"] = msg.groundspeed
+                self.state["airspeed"] = msg.airspeed      # VTOL-critical
+                self.state["climb"] = msg.climb
+                self.state["throttle"] = msg.throttle
             elif t == "SYS_STATUS":
                 self.state["battery_v"] = msg.voltage_battery / 1000.0
+                if msg.current_battery >= 0:
+                    self.state["battery_a"] = msg.current_battery / 100.0
+                self.state["battery_pct"] = msg.battery_remaining
+            elif t == "GPS_RAW_INT":
+                self.state["gps_fix"] = msg.fix_type
+                self.state["gps_fix_name"] = _GPS_FIX_NAMES.get(
+                    msg.fix_type, str(msg.fix_type))
+                self.state["satellites"] = msg.satellites_visible
+                if msg.eph != 65535:
+                    self.state["hdop"] = msg.eph / 100.0
+            elif t == "EKF_STATUS_REPORT":
+                self.state["ekf_flags"] = msg.flags
+                self.state["ekf_ok"] = (
+                    (msg.flags & _EKF_HEALTHY_BITS) == _EKF_HEALTHY_BITS)
+            elif t == "MISSION_CURRENT":
+                self.state["current_wp"] = msg.seq
+            elif t == "NAV_CONTROLLER_OUTPUT":
+                self.state["wp_dist"] = msg.wp_dist
+            elif t == "HOME_POSITION":
+                self.state["home_lat"] = msg.latitude / 1e7
+                self.state["home_lon"] = msg.longitude / 1e7
+                self.state["home_alt"] = msg.altitude / 1000.0
+            elif t == "STATUSTEXT":
+                if from_vehicle:
+                    self._push_event(msg.severity, msg.text)
+            elif t == "EXTENDED_SYS_STATE":
+                self.state["vtol_state"] = _VTOL_STATE_NAMES.get(
+                    msg.vtol_state, msg.vtol_state)
+                self.state["landed_state"] = msg.landed_state
             elif t == "COMMAND_ACK":
+                # MAVLink2 ACKs carry a target; drop ACKs addressed to the
+                # other GCS (e.g. Mission Planner) so results don't cross.
+                tgt = getattr(msg, "target_system", 0)
+                if tgt not in (0, GCS_SOURCE_SYSTEM):
+                    continue
                 with self._ack_lock:
                     entry = self._ack_events.pop(msg.command, None)
                 if entry:
@@ -172,6 +293,86 @@ class Bridge:
             for lst in self._subs.values():
                 if q in lst:
                     lst.remove(q)
+
+    # ------------- STATUSTEXT events -------------
+    def _push_event(self, severity: int, text: str):
+        with self._events_lock:
+            self._event_seq += 1
+            evt = {"seq": self._event_seq,
+                   "time": time.time(),
+                   "severity": severity,
+                   "severity_name": _SEVERITY_NAMES.get(severity,
+                                                        str(severity)),
+                   "text": text}
+            self._events.append(evt)
+        self._log_event(evt)
+
+    def events_since(self, seq: int) -> list:
+        """Events newer than seq (frontend polls or WS streams these)."""
+        with self._events_lock:
+            return [e for e in self._events if e["seq"] > seq]
+
+    # ------------- flight logging (CSV per armed flight) -------------
+    _LOG_FIELDS = ["time", "lat", "lon", "alt_rel", "mode", "armed",
+                   "roll", "pitch", "yaw", "groundspeed", "airspeed",
+                   "climb", "throttle", "heading", "battery_v",
+                   "battery_pct", "gps_fix_name", "satellites",
+                   "vtol_state", "current_wp", "wp_dist"]
+
+    def _log_start(self):
+        name = None
+        with self._log_lock:
+            if self._log_fh:
+                return
+            try:
+                LOG_DIR.mkdir(parents=True, exist_ok=True)
+                name = datetime.now().strftime("flight_%Y%m%d_%H%M%S.csv")
+                self._log_fh = open(LOG_DIR / name, "w", newline="")
+                w = csv.writer(self._log_fh)
+                w.writerow(self._LOG_FIELDS + ["event"])
+            except OSError as e:
+                self._log_fh = None
+                name = None
+                print(f"[log] could not open flight log: {e}")
+        if name:
+            # outside the lock: _push_event -> _log_event re-acquires it
+            self._push_event(6, f"GCS: flight log started ({name})")
+
+    def _log_stop(self):
+        with self._log_lock:
+            if self._log_fh:
+                try:
+                    self._log_fh.close()
+                except OSError:
+                    pass
+                self._log_fh = None
+
+    def _log_row(self):
+        """~5 Hz telemetry rows while armed (called from 10 Hz position)."""
+        if not self._log_fh or time.time() - self._log_last_row < 0.2:
+            return
+        self._log_last_row = time.time()
+        with self._log_lock:
+            if not self._log_fh:
+                return
+            try:
+                csv.writer(self._log_fh).writerow(
+                    [f"{time.time():.2f}"] +
+                    [self.state[k] for k in self._LOG_FIELDS[1:]] + [""])
+            except (OSError, ValueError):
+                pass
+
+    def _log_event(self, evt: dict):
+        with self._log_lock:
+            if not self._log_fh:
+                return
+            try:
+                csv.writer(self._log_fh).writerow(
+                    [f"{evt['time']:.2f}"] +
+                    [""] * (len(self._LOG_FIELDS) - 1) +
+                    [f"[{evt['severity_name']}] {evt['text']}"])
+            except (OSError, ValueError):
+                pass
 
     # ------------- ACK-verified command primitive -------------
     def _send_verified(self, cmd_id: int, sender) -> dict:
@@ -215,19 +416,121 @@ class Bridge:
                 mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
                 mapping[mode], 0, 0, 0, 0, 0))
 
+    def available_modes(self) -> dict:
+        """Flight modes valid for THIS vehicle (copter vs plane differ
+        completely — even the custom_mode numbers). The frontend should
+        build its mode buttons from this instead of hardcoding."""
+        if not self.connected:
+            raise ConnectionError("Not connected")
+        mapping = self.master.mode_mapping() or {}
+        return {"vehicle": self.state["vehicle"],
+                "modes": sorted(mapping)}
+
     def takeoff(self, alt_m: float) -> dict:
+        """Copter: guided takeoff. QuadPlane (ArduPlane >= 4.2): the same
+        NAV_TAKEOFF in GUIDED performs a vertical VTOL takeoff, provided
+        Q_GUIDED_MODE is configured; the FC's ACK tells us the truth."""
         cmd = mavutil.mavlink.MAV_CMD_NAV_TAKEOFF
         return self._send_verified(cmd, lambda:
             self.master.mav.command_long_send(
                 self.master.target_system, self.master.target_component,
                 cmd, 0, 0, 0, 0, 0, 0, 0, alt_m))
 
-    def rtl(self) -> dict:
+    def rtl(self, vtol_land: bool = False) -> dict:
+        """Return to launch.
+        vtol_land=True on a QuadPlane switches to QRTL: fly home, then
+        transition to hover and land vertically. Plain RTL on a plane
+        only loiters at home altitude and never lands (unless
+        Q_RTL_MODE=1 is set on the FC). Copter ignores the flag."""
+        if vtol_land:
+            mapping = self.master.mode_mapping() or {}
+            if "QRTL" in mapping:
+                return self.set_mode("QRTL")
+            # not a quadplane — fall through to normal RTL
         cmd = mavutil.mavlink.MAV_CMD_NAV_RETURN_TO_LAUNCH
         return self._send_verified(cmd, lambda:
             self.master.mav.command_long_send(
                 self.master.target_system, self.master.target_component,
                 cmd, 0, 0, 0, 0, 0, 0, 0, 0))
+
+    def land(self) -> dict:
+        """Land at the current position. QuadPlane: QLAND (vertical);
+        copter: LAND. The big red button, distinct from RTL."""
+        if not self.connected:
+            raise ConnectionError("Not connected")
+        mapping = self.master.mode_mapping() or {}
+        for m in ("QLAND", "LAND"):
+            if m in mapping:
+                return self.set_mode(m)
+        raise ValueError("No LAND/QLAND mode on this vehicle")
+
+    def pause(self) -> dict:
+        """Hold position: QLOITER (QuadPlane hover) or LOITER (copter).
+        On a fixed-wing-only plane LOITER circles in place — still a
+        pause. Mission state is preserved; resume() continues it."""
+        if not self.connected:
+            raise ConnectionError("Not connected")
+        mapping = self.master.mode_mapping() or {}
+        for m in ("QLOITER", "LOITER"):
+            if m in mapping:
+                return self.set_mode(m)
+        raise ValueError("No loiter mode available to pause into")
+
+    def resume(self) -> dict:
+        """Continue the interrupted AUTO mission from the current item."""
+        return self.set_mode("AUTO")
+
+    def change_speed(self, speed_ms: float, airspeed: bool = True) -> dict:
+        """In-flight speed change. airspeed=True targets airspeed (what a
+        plane/VTOL flies by); False targets groundspeed (copter-style)."""
+        cmd = mavutil.mavlink.MAV_CMD_DO_CHANGE_SPEED
+        stype = 0 if airspeed else 1
+        return self._send_verified(cmd, lambda:
+            self.master.mav.command_long_send(
+                self.master.target_system, self.master.target_component,
+                cmd, 0, stype, speed_ms, -1, 0, 0, 0, 0))
+
+    def change_altitude(self, alt_m: float) -> dict:
+        """GUIDED altitude change, keeping the current position target.
+        Plane/QuadPlane: MAV_CMD_GUIDED_CHANGE_ALTITUDE. Copter: re-send
+        the position target at the current lat/lon with the new alt."""
+        if not self.connected:
+            raise ConnectionError("Not connected")
+        if self.state["mode"] != "GUIDED":
+            raise ValueError("Altitude change requires GUIDED mode "
+                             f"(current: {self.state['mode']})")
+        if self.state["vehicle"] in ("plane", "vtol"):
+            cmd = mavutil.mavlink.MAV_CMD_GUIDED_CHANGE_ALTITUDE
+            return self._send_verified(cmd, lambda:
+                self.master.mav.command_int_send(
+                    self.master.target_system, self.master.target_component,
+                    mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
+                    cmd, 0, 0, 0, 0, 0, 0, 0, 0, alt_m))
+        return self.goto(self.state["lat"], self.state["lon"], alt_m)
+
+    def set_current_wp(self, seq: int) -> dict:
+        """Jump the active mission item ("skip to this waypoint on the
+        map"). Confirmed by the FC echoing MISSION_CURRENT."""
+        if not self.connected:
+            raise ConnectionError("Not connected")
+        q = self._subscribe("MISSION_CURRENT")
+        try:
+            with self._lock:
+                self.master.mav.mission_set_current_send(
+                    self.master.target_system, self.master.target_component,
+                    seq)
+            deadline = time.time() + 3
+            while time.time() < deadline:
+                try:
+                    msg = q.get(timeout=1)
+                except queue_mod.Empty:
+                    continue
+                if msg.seq == seq:
+                    return {"result": "ACCEPTED", "accepted": True,
+                            "current_wp": seq}
+            return {"result": "TIMEOUT_NO_CONFIRM", "accepted": False}
+        finally:
+            self._unsubscribe(q)
 
     def vtol_transition(self, to_fixed_wing: bool) -> dict:
         """Command a QuadPlane VTOL transition (MAV_CMD_DO_VTOL_TRANSITION).
@@ -264,26 +567,32 @@ class Bridge:
                 "target": {"lat": lat, "lon": lon, "alt": alt_m},
                 "note": "Track convergence via /ws/telemetry"}
 
-    # =================== MISSION PROTOCOL ===================
-    def mission_download(self) -> list:
-        """Pull the full mission from the FC (MISSION protocol)."""
+    # =================== MISSION / FENCE / RALLY PROTOCOL ===============
+    _MISSION_TYPES = {
+        "mission": 0,   # MAV_MISSION_TYPE_MISSION
+        "fence": 1,     # MAV_MISSION_TYPE_FENCE
+        "rally": 2,     # MAV_MISSION_TYPE_RALLY
+    }
+
+    def mission_download(self, kind: str = "mission") -> list:
+        """Pull the full mission/fence/rally list from the FC."""
         if not self.connected:
             raise ConnectionError("Not connected")
+        mt = self._MISSION_TYPES[kind]
         q = self._subscribe("MISSION_COUNT", "MISSION_ITEM_INT",
                             "MISSION_ITEM")
         try:
             with self._lock:
                 self.master.mav.mission_request_list_send(
                     self.master.target_system, self.master.target_component,
-                    mavutil.mavlink.MAV_MISSION_TYPE_MISSION)
+                    mt)
             count_msg = self._q_wait(q, "MISSION_COUNT", 5)
             items = []
             for seq in range(count_msg.count):
                 with self._lock:
                     self.master.mav.mission_request_int_send(
                         self.master.target_system,
-                        self.master.target_component, seq,
-                        mavutil.mavlink.MAV_MISSION_TYPE_MISSION)
+                        self.master.target_component, seq, mt)
                 item = self._q_wait(q, ("MISSION_ITEM_INT", "MISSION_ITEM"),
                                     5, seq=seq)
                 is_int = item.get_type() == "MISSION_ITEM_INT"
@@ -303,25 +612,30 @@ class Bridge:
             with self._lock:
                 self.master.mav.mission_ack_send(
                     self.master.target_system, self.master.target_component,
-                    mavutil.mavlink.MAV_MISSION_ACCEPTED,
-                    mavutil.mavlink.MAV_MISSION_TYPE_MISSION)
+                    mavutil.mavlink.MAV_MISSION_ACCEPTED, mt)
             return items
         finally:
             self._unsubscribe(q)
 
-    def mission_upload(self, waypoints: list) -> dict:
-        """Push a mission (MISSION protocol handshake, 1e7 int coords).
-        waypoints: [{lat, lon, alt, command?, param1..4?, frame?}, ...]
-        Item 0 is conventionally home; ArduPilot manages it, so we
-        prepend a dummy home item automatically."""
+    def mission_upload(self, waypoints: list,
+                       kind: str = "mission") -> dict:
+        """Push a mission/fence/rally list (MISSION protocol handshake,
+        1e7 int coords). waypoints: [{lat, lon, alt, command?, param1..4?,
+        frame?}, ...]. For kind="mission", item 0 is conventionally home;
+        ArduPilot manages it, so we prepend a dummy home item. Fence and
+        rally lists have no home item — items upload as given (fence
+        vertices use command NAV_FENCE_* with param1 = vertex count;
+        rally points use NAV_RALLY_POINT — supplied by the caller)."""
         if not self.connected:
             raise ConnectionError("Not connected")
-        mt = mavutil.mavlink.MAV_MISSION_TYPE_MISSION
-        # Build item list: seq 0 = home placeholder, then user waypoints
-        items = [dict(lat=0, lon=0, alt=0,
-                      command=mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
-                      frame=mavutil.mavlink.MAV_FRAME_GLOBAL,
-                      param1=0, param2=0, param3=0, param4=0)]
+        mt = self._MISSION_TYPES[kind]
+        items = []
+        if kind == "mission":
+            # seq 0 = home placeholder, then user waypoints
+            items.append(dict(lat=0, lon=0, alt=0,
+                              command=mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
+                              frame=mavutil.mavlink.MAV_FRAME_GLOBAL,
+                              param1=0, param2=0, param3=0, param4=0))
         for wp in waypoints:
             items.append(dict(
                 lat=wp["lat"], lon=wp["lon"], alt=wp["alt"],
@@ -370,15 +684,16 @@ class Bridge:
         finally:
             self._unsubscribe(q)
 
-    def mission_clear(self) -> dict:
+    def mission_clear(self, kind: str = "mission") -> dict:
         if not self.connected:
             raise ConnectionError("Not connected")
+        mt = self._MISSION_TYPES[kind]
         q = self._subscribe("MISSION_ACK")
         try:
             with self._lock:
                 self.master.mav.mission_clear_all_send(
                     self.master.target_system, self.master.target_component,
-                    mavutil.mavlink.MAV_MISSION_TYPE_MISSION)
+                    mt)
             msg = self._q_wait(q, "MISSION_ACK", 5)
             name = mavutil.mavlink.enums[
                 "MAV_MISSION_RESULT"][msg.type].name
@@ -498,6 +813,7 @@ class Bridge:
     def teardown(self):
         """Drop the link so the supervisor (or a user) can reconnect."""
         self.connected = False
+        self._log_stop()
         if self.master:
             try:
                 self.master.close()
@@ -505,16 +821,30 @@ class Bridge:
                 pass
             self.master = None
 
+    def disconnect(self) -> dict:
+        """User-intended disconnect: drop the link AND tell the
+        supervisor to stand down, so it doesn't auto-reconnect. Lets the
+        operator switch between SITL and the real drone at runtime."""
+        self._want_link = False
+        was = self.connected
+        self.teardown()
+        return {"disconnected": True, "was_connected": was}
+
     def start_supervisor(self, connection: str, baud: int = 115200):
         """Autonomous mode: keep the link up forever.
         Connects on startup, watches heartbeat health, and reconnects
-        automatically after any link loss. Runs for the process lifetime."""
+        automatically after any link loss. Runs for the process lifetime.
+        Stands down while the user has explicitly disconnected."""
         if self._supervising:
             return
         self._supervising = True
+        self._want_link = True
 
         def loop():
             while True:
+                if not self._want_link:
+                    time.sleep(1)          # user disconnected on purpose
+                    continue
                 if not self.connected:
                     try:
                         self.connect(connection, baud)
@@ -587,7 +917,7 @@ class GotoBody(BaseModel):
 
 def _run(fn, *args):
     """Run blocking bridge call in a worker thread (keeps event loop free)."""
-    return asyncio.get_event_loop().run_in_executor(None, fn, *args)
+    return asyncio.get_running_loop().run_in_executor(None, fn, *args)
 
 
 class ConnectBody(BaseModel):
@@ -605,6 +935,13 @@ async def connect(body: ConnectBody = ConnectBody()):
         return {"connected": True, "connection": body.connection}
     except Exception as e:
         raise HTTPException(status_code=503, detail=str(e))
+
+
+@app.post("/disconnect")
+async def disconnect():
+    """Drop the drone link and stand down auto-reconnect, so the
+    operator can switch targets (e.g. SITL -> real drone) at runtime."""
+    return await _run(bridge.disconnect)
 
 
 @app.get("/status")
@@ -687,12 +1024,129 @@ async def cmd_goto(body: GotoBody):
         raise _guard(e)
 
 
+class RtlBody(BaseModel):
+    vtol_land: bool = Field(
+        default=False,
+        description="QuadPlane: use QRTL (fly home, hover, land "
+                    "vertically) instead of fixed-wing RTL loiter")
+
+
 @app.post("/command/rtl")
-async def cmd_rtl():
+async def cmd_rtl(body: RtlBody = RtlBody()):
     try:
-        return await _run(bridge.rtl)
+        return await _run(bridge.rtl, body.vtol_land)
     except Exception as e:
         raise _guard(e)
+
+
+@app.get("/modes")
+async def modes():
+    """Modes valid for the connected vehicle — frontend builds its mode
+    buttons from this list (copter and QuadPlane modes are disjoint)."""
+    try:
+        return await _run(bridge.available_modes)
+    except Exception as e:
+        raise _guard(e)
+
+
+@app.post("/command/land")
+async def cmd_land():
+    """Land at the current position (QLAND on QuadPlane, LAND on copter)."""
+    try:
+        return await _run(bridge.land)
+    except Exception as e:
+        raise _guard(e)
+
+
+@app.post("/command/pause")
+async def cmd_pause():
+    """Hold position now (QLOITER/LOITER). Mission resumes with /resume."""
+    try:
+        return await _run(bridge.pause)
+    except Exception as e:
+        raise _guard(e)
+
+
+@app.post("/command/resume")
+async def cmd_resume():
+    """Continue the paused AUTO mission from the current item."""
+    try:
+        return await _run(bridge.resume)
+    except Exception as e:
+        raise _guard(e)
+
+
+class SpeedBody(BaseModel):
+    speed: float = Field(gt=0, le=100, description="m/s")
+    airspeed: bool = Field(
+        default=True,
+        description="True = airspeed target (plane/VTOL); "
+                    "False = groundspeed (copter)")
+
+
+@app.post("/command/speed")
+async def cmd_speed(body: SpeedBody):
+    try:
+        return await _run(bridge.change_speed, body.speed, body.airspeed)
+    except Exception as e:
+        raise _guard(e)
+
+
+class AltitudeBody(BaseModel):
+    altitude: float = Field(gt=0, le=1000, description="relative alt, m")
+
+
+@app.post("/command/altitude")
+async def cmd_altitude(body: AltitudeBody):
+    """GUIDED altitude nudge, keeping the current position target."""
+    try:
+        return await _run(bridge.change_altitude, body.altitude)
+    except Exception as e:
+        raise _guard(e)
+
+
+class SetWpBody(BaseModel):
+    seq: int = Field(ge=0, le=700)
+
+
+@app.post("/command/set_wp")
+async def cmd_set_wp(body: SetWpBody):
+    """Jump the active mission to this item (map click: 'skip to here')."""
+    try:
+        return await _run(bridge.set_current_wp, body.seq)
+    except Exception as e:
+        raise _guard(e)
+
+
+@app.get("/events")
+async def events(since: int = 0):
+    """FC status messages (arming failures, prearm reasons, warnings)
+    newer than `since`. WS clients get these pushed; this is for polling
+    or backfilling a message console on (re)connect."""
+    return {"events": bridge.events_since(since)}
+
+
+@app.get("/logs")
+async def logs_list():
+    """Flight logs recorded by the backend (one CSV per armed flight)."""
+    if not LOG_DIR.exists():
+        return {"dir": str(LOG_DIR), "logs": []}
+    files = sorted(LOG_DIR.glob("flight_*.csv"), reverse=True)
+    return {"dir": str(LOG_DIR),
+            "logs": [{"name": f.name, "size": f.stat().st_size}
+                     for f in files]}
+
+
+@app.get("/logs/{name}")
+async def logs_get(name: str):
+    # strict name check — no path traversal
+    if not (name.startswith("flight_") and name.endswith(".csv")
+            and "/" not in name and "\\" not in name and ".." not in name):
+        raise HTTPException(status_code=400, detail="Bad log name")
+    path = LOG_DIR / name
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Log not found")
+    return FileResponse(path, media_type="text/csv", filename=name)
 
 
 class TransitionBody(BaseModel):
@@ -712,8 +1166,9 @@ async def cmd_transition(body: TransitionBody):
 class Waypoint(BaseModel):
     lat: float = Field(ge=-90, le=90)
     lon: float = Field(ge=-180, le=180)
-    alt: float = Field(gt=0, le=10000)
+    alt: float = Field(ge=0, le=10000)   # ge=0: fence vertices use alt 0
     command: Optional[int] = None      # MAV_CMD, default NAV_WAYPOINT
+    frame: Optional[int] = None        # MAV_FRAME, default GLOBAL_RELATIVE_ALT
     param1: float = 0
     param2: float = 0
     param3: float = 0
@@ -762,6 +1217,40 @@ async def cmd_mission_start():
         raise _guard(e)
 
 
+def _list_endpoints(kind: str):
+    """GET/POST/DELETE trio for fence and rally via the same transport."""
+
+    @app.get(f"/{kind}", name=f"{kind}_get")
+    async def _get():
+        try:
+            items = await _run(bridge.mission_download, kind)
+            return {"count": len(items), "items": items}
+        except Exception as e:
+            raise _guard(e)
+
+    @app.post(f"/{kind}", name=f"{kind}_post")
+    async def _post(body: MissionBody):
+        try:
+            wps = [w.model_dump(exclude_none=True) for w in body.waypoints]
+            return await _run(bridge.mission_upload, wps, kind)
+        except Exception as e:
+            raise _guard(e)
+
+    @app.delete(f"/{kind}", name=f"{kind}_delete")
+    async def _delete():
+        try:
+            return await _run(bridge.mission_clear, kind)
+        except Exception as e:
+            raise _guard(e)
+
+
+# /fence: polygon vertices (NAV_FENCE_POLYGON_VERTEX_INCLUSION, param1 =
+# vertex count) or circles; /rally: NAV_RALLY_POINT items — safe QRTL
+# landing spots other than home. Frontend supplies the command numbers.
+_list_endpoints("fence")
+_list_endpoints("rally")
+
+
 @app.get("/parameters")
 async def params_all():
     try:
@@ -788,11 +1277,25 @@ async def params_set(name: str, body: ParamSetBody):
 
 @app.websocket("/ws/telemetry")
 async def ws_telemetry(ws: WebSocket):
-    """Streams vehicle state as JSON at 10 Hz."""
+    """Typed JSON frames:
+      {"type": "state", ...snapshot}  at 10 Hz
+      {"type": "event", "seq", "severity", "severity_name", "text", "time"}
+        pushed as FC STATUSTEXT arrives (arming failures, warnings, etc.)
+    Frontends route on "type"; unknown types must be ignored (forward
+    compatibility)."""
     await ws.accept()
+    last_seq = 0
+    # backfill recent events so a (re)connecting client sees context
+    for evt in bridge.events_since(0)[-20:]:
+        last_seq = evt["seq"]
     try:
         while True:
-            await ws.send_json(bridge.snapshot())
+            for evt in bridge.events_since(last_seq):
+                last_seq = evt["seq"]
+                await ws.send_json({"type": "event", **evt})
+            await ws.send_json({"type": "state", **bridge.snapshot()})
             await asyncio.sleep(0.1)
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, Exception):
+        # abrupt client drops raise transport errors, not only
+        # WebSocketDisconnect — either way, just end this stream
         pass

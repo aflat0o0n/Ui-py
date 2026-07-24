@@ -45,8 +45,11 @@ class _Job(QRunnable):
 
 
 class _TelemetryThread(QThread):
-    """Persistent WebSocket reader; emits state dicts at 10 Hz."""
+    """Persistent WebSocket reader. Routes typed frames from the backend:
+    {"type":"state"} -> received (10 Hz), {"type":"event"} -> event
+    (FC status messages: arming failures, prearm reasons, warnings)."""
     received = pyqtSignal(dict)
+    event = pyqtSignal(dict)
     dropped = pyqtSignal(str)
 
     def run(self):
@@ -55,7 +58,13 @@ class _TelemetryThread(QThread):
         try:
             ws = websocket.create_connection(url, timeout=10)
             while not self.isInterruptionRequested():
-                self.received.emit(json.loads(ws.recv()))
+                frame = json.loads(ws.recv())
+                kind = frame.get("type", "state")
+                if kind == "state":
+                    self.received.emit(frame)
+                elif kind == "event":
+                    self.event.emit(frame)
+                # unknown frame types: ignore (forward compatibility)
         except Exception as e:
             self.dropped.emit(f"telemetry stream ended: {e}")
 
@@ -65,7 +74,14 @@ class DroneClient(QObject):
 
     # -------- signals the GUI subscribes to --------
     telemetry = pyqtSignal(dict)            # {"lat","lon","alt_rel","mode",
-                                            #  "armed","link_alive",...} 10 Hz
+                                            #  "armed","roll","pitch","yaw",
+                                            #  "gps_fix_name","satellites",
+                                            #  "ekf_ok","vtol_state",
+                                            #  "current_wp","wp_dist",
+                                            #  "home_lat",...} 10 Hz
+    event = pyqtSignal(dict)                # FC status message:
+                                            # {"severity_name","text","time"}
+                                            # -> message console + toasts
     connection_changed = pyqtSignal(bool)   # backend<->drone link state
     command_result = pyqtSignal(str, dict)  # ("ARM", {"accepted": True, ...})
     error = pyqtSignal(str)                 # human-readable problems
@@ -145,8 +161,13 @@ class DroneClient(QObject):
             return
         self._tele = _TelemetryThread()
         self._tele.received.connect(self.telemetry)
+        self._tele.event.connect(self.event)
         self._tele.dropped.connect(self.error)
         self._tele.start()
+
+    def disconnect_drone(self):
+        """Drop the drone link (e.g. to switch SITL <-> real drone)."""
+        self._post("DISCONNECT", "/disconnect")
 
     def shutdown(self):
         """Call from the window's closeEvent."""
@@ -168,8 +189,48 @@ class DroneClient(QObject):
         self._post("GOTO", "/command/goto",
                    {"lat": lat, "lon": lon, "altitude": altitude})
 
-    def rtl(self):
-        self._post("RTL", "/command/rtl")
+    def rtl(self, vtol_land: bool = False):
+        """vtol_land=True on a QuadPlane: QRTL (fly home, land
+        vertically). Plain RTL on a plane only loiters at home."""
+        self._post("RTL", "/command/rtl", {"vtol_land": vtol_land})
+
+    def land(self):
+        """Land right here: QLAND (QuadPlane) / LAND (copter)."""
+        self._post("LAND", "/command/land")
+
+    def pause(self):
+        """Hold position now (QLOITER/LOITER); mission is preserved."""
+        self._post("PAUSE", "/command/pause")
+
+    def resume(self):
+        """Continue the paused AUTO mission."""
+        self._post("RESUME", "/command/resume")
+
+    def transition(self, fixed_wing: bool):
+        """VTOL transition: True -> forward flight, False -> hover."""
+        self._post("TRANSITION", "/command/transition",
+                   {"fixed_wing": fixed_wing})
+
+    def change_speed(self, speed_ms: float, airspeed: bool = True):
+        self._post("SPEED", "/command/speed",
+                   {"speed": speed_ms, "airspeed": airspeed})
+
+    def change_altitude(self, altitude: float):
+        """GUIDED altitude nudge at the current position."""
+        self._post("ALTITUDE", "/command/altitude", {"altitude": altitude})
+
+    def set_current_wp(self, seq: int):
+        """Map click: skip the mission to this waypoint."""
+        self._post("SET_WP", "/command/set_wp", {"seq": seq})
+
+    def fetch_modes(self):
+        """Modes valid for THIS vehicle -> command_result ("MODES", {...}).
+        Build mode buttons from this; copter/QuadPlane sets differ."""
+        self._get("MODES", "/modes", timeout=10)
+
+    def fetch_events(self, since: int = 0):
+        """Backfill FC status messages for the message console."""
+        self._get("EVENTS", f"/events?since={since}", timeout=10)
 
     # -------- missions --------
     def upload_mission(self, waypoints: list[dict]):
@@ -190,6 +251,39 @@ class DroneClient(QObject):
 
     def start_mission(self):
         self._post("MISSION_START", "/command/mission_start")
+
+    # -------- geofence & rally points (same shape as missions) --------
+    def upload_fence(self, vertices: list[dict]):
+        """Polygon fence: [{"lat","lon","alt":0,"command":5001,
+        "param1":N}, ...] where 5001 = NAV_FENCE_POLYGON_VERTEX_INCLUSION
+        and param1 = total vertex count (same on every vertex)."""
+        self._post("FENCE_UPLOAD", "/fence", {"waypoints": vertices})
+
+    def download_fence(self):
+        self._get("FENCE_DOWNLOAD", "/fence")
+
+    def clear_fence(self):
+        self._delete("FENCE_CLEAR", "/fence")
+
+    def upload_rally(self, points: list[dict]):
+        """Rally points: [{"lat","lon","alt","command":5100}, ...]
+        (5100 = NAV_RALLY_POINT). Safe QRTL landing spots besides home."""
+        self._post("RALLY_UPLOAD", "/rally", {"waypoints": points})
+
+    def download_rally(self):
+        self._get("RALLY_DOWNLOAD", "/rally")
+
+    def clear_rally(self):
+        self._delete("RALLY_CLEAR", "/rally")
+
+    def _delete(self, name: str, path: str):
+        def work():
+            try:
+                r = requests.delete(BACKEND + path, timeout=15)
+                self.command_result.emit(name, r.json())
+            except requests.exceptions.RequestException as e:
+                self.error.emit(f"{name}: {e}")
+        self._pool.start(_Job(work))
 
     # -------- parameters --------
     def fetch_all_parameters(self):
